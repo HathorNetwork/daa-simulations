@@ -31,9 +31,22 @@ def get_orphans(miner, *, min_timestamp: float = 0):
                 yield block
 
 
-def blocks_per_miner(miner):
+def all_blocks_per_miner(miner):
     d = defaultdict(int)
     for block in miner.get_blocks():
+        d[block.miner] += 1
+    return d
+
+def best_blockchain_per_miner(manager):
+    miner = manager.miners[0]
+    d = defaultdict(int)
+    for block in miner.best_block.get_blockchain():
+        d[block.miner] += 1
+    return d
+
+def blocks_per_miner(it):
+    d = defaultdict(int)
+    for block in it:
         d[block.miner] += 1
     return d
 
@@ -83,7 +96,7 @@ def plot_difficulty(managers, *, min_timestamp=0, save_to=None):
     grid = plt.GridSpec(4, 1, wspace=0.4, hspace=0.3)
     plt.subplot(grid[:3, 0])
     plt.xlabel('Time (days)')
-    plt.ylabel('Weight')
+    plt.ylabel('Difficulty ($log_2(H)$)')
     plt.xticks(fontsize=8)
     plt.yticks(fontsize=8)
     plt.title(title)
@@ -105,3 +118,38 @@ def plot_difficulty(managers, *, min_timestamp=0, save_to=None):
         plt.savefig(save_to, dpi=300)
     else:
         plt.show()
+
+
+def mining_stats(managers, save_to=None):
+    for manager in managers:
+        blocks = best_blockchain_per_miner(manager)
+        hashes = dict((x.name, x.hashrate) for x in manager.miners)
+        miners = dict((x.name, x) for x in manager.miners)
+
+        total_blocks = sum(x for x in blocks.values())
+        total_hash = sum(x for x in hashes.values())
+        blocks_percent = dict((k, v / total_blocks) for k, v in blocks.items())
+        hashes_percent = dict((k, v / total_hash) for k, v in hashes.items())
+
+        names = [x.name for x in manager.miners]
+        names.sort()
+
+        for x in names:
+            miner = miners[x]
+            print('{}'.format(x))
+            print('  log(H) = {:.6f}'.format(log(miner.hashrate, 2)))
+            print('  best block height={} weight={} logwork={}'.format(
+                miner.best_block.height,
+                miner.best_block.weight,
+                miner.best_block.logwork)
+            )
+            print('  {} blocks ({:.6f}) expected={:.6f}'.format(
+                blocks.get(x, 0),
+                blocks_percent.get(x, 0),
+                hashes_percent.get(x, 0),
+            ))
+            total_orphans = len(list(get_orphans(miner)))
+            print('  {} orphan blocks'.format(total_orphans))
+            print('  orphan', blocks_per_miner(get_orphans(miner)).items())
+            print('  all_blocks', blocks_per_miner(miner.known_blocks.values()).items())
+            print('')

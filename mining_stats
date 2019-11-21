@@ -1,0 +1,13 @@
+#!python3
+
+import sys
+import os
+import pickle
+import utils
+
+filename = sys.argv[1]
+
+managers = pickle.load(open(filename, 'rb'))
+if not isinstance(managers, list):
+    managers = [managers]
+utils.mining_stats(managers)

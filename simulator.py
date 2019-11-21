@@ -3,6 +3,7 @@ import heapq
 import random
 from collections import defaultdict
 from enum import Enum
+from math import log
 from typing import NamedTuple
 
 import numpy.random
@@ -13,7 +14,6 @@ from utils import sum_weights
 class EventType(Enum):
     NEW_BLOCK = 1
     BLOCK_PROPAGATION = 2
-    OTHER = 2
 
 
 class DelayedCall:
@@ -26,7 +26,7 @@ class DelayedCall:
         self.active = True
 
     def __repr__(self):
-        return 'DelayedCall({}, {}, {}, {})'.format(self.seconds, self.fn, self.args, self.kwargs)
+        return 'DelayedCall({}, {}, {})'.format(self.ev_type, self.seconds, self.fn)
 
     def __gt__(self, other):
         return self.seconds > other.seconds
@@ -68,7 +68,7 @@ class Block(NamedTuple):
 
 class Miner:
     counter = 1
-    weight_decay = False
+    name_prefix = 'Miner'
 
     def __init__(self, hashrate: int, *, is_quiet: bool = False) -> None:
         self.hashrate = hashrate
@@ -76,7 +76,7 @@ class Miner:
         self.known_blocks = {}   # Dict[int, Block]
         self.best_block = None
         self.neighbors = []
-        self.name = 'Miner {}'.format(Miner.counter)
+        self.name = '{} {}'.format(self.name_prefix, Miner.counter)
         self.block_timer = None
         self.is_running = False
         self.is_quiet = is_quiet
@@ -97,23 +97,8 @@ class Miner:
     def get_blocks(self):
         return self.known_blocks.values()
 
-    def get_next_block_dt(self, weight):
-        geometric_p = 2**(-weight)
-        attempts = numpy.random.geometric(geometric_p)
-        dt = attempts / self.hashrate
-        return dt
-
     def schedule_next_block(self) -> None:
-        weight = self.manager.getWeight(self.best_block.get_blockchain())
-        dt = self.get_next_block_dt(weight)
-        if self.weight_decay:
-            max_k = 300
-            while dt > max_k * self.manager.target:
-                if self.name == 'Miner 2' and self.manager.seconds() > 3600 * 24:
-                    import pudb; pudb.set_trace()
-                weight -= 2.73
-                dt = max_k * self.manager.target + self.get_next_block_dt(weight)
-                max_k += 60
+        weight, dt = self.manager.get_miner_next_block(self)
 
         seconds = self.manager.seconds()
         parent = self.best_block
@@ -130,6 +115,9 @@ class Miner:
         )
 
         self.block_timer = self.manager.callLater(EventType.NEW_BLOCK, dt, self.on_block_found, block)
+    
+    def on_new_best_block(self, new_best_block):
+        self.best_block = new_best_block
 
     def on_block_found(self, block, propagated=False) -> None:
         if block.hash in self.known_blocks:
@@ -146,7 +134,7 @@ class Miner:
 
         self.known_blocks[block.hash] = block
         if block.logwork > self.best_block.logwork:
-            self.best_block = block
+            self.on_new_best_block(block)
 
         if self.is_running:
             self.schedule_next_block()
@@ -157,13 +145,47 @@ class Miner:
 
     def propagate_block(self, block) -> None:
         for neighbor in self.get_neighbors():
-            if neighbor.miner.is_running:
-                dt = neighbor.get_random_delay()
-                self.manager.callLater(EventType.BLOCK_PROPAGATION, dt, neighbor.miner.on_block_found, block, propagated=True)
+            dt = neighbor.get_random_delay()
+            self.manager.callLater(EventType.BLOCK_PROPAGATION, dt, neighbor.miner.on_block_found, block, propagated=True)
 
+
+class Miner51Attack(Miner):
+    name_prefix = 'Miner51Attack'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_attacking = False
+        self.buffer = []
+
+    def start_attack(self, first_block=None):
+        self.is_attacking = True
+        if first_block:
+            self.best_block = first_block
+
+    def stop_attack(self):
+        self.is_attacking = False
+        self.best_block = max(self.known_blocks.values(), key=lambda x: x.logwork)
+        self.flush_blocks()
+
+    def on_new_best_block(self, new_best_block):
+        if not self.is_attacking:
+            self.best_block = new_best_block
+        else:
+            if new_best_block.miner == self.name:
+                self.best_block = new_best_block
+
+    def propagate_block(self, block) -> None:
+        if self.is_attacking:
+            self.buffer.append(block)
+        else:
+            super().propagate_block(block)
+
+    def flush_blocks(self):
+        for block in self.buffer:
+            self.propagate_block(block)
 
 class Manager:
-    def __init__(self, daa):
+    def __init__(self, daa, *, weight_decay=False):
         self.miners = []
         self.genesis = Block(
             hash=random.getrandbits(256),
@@ -181,6 +203,7 @@ class Manager:
         self.target = 30     # seconds
         self.daa = daa
         self.is_running = False
+        self.weight_decay = weight_decay
 
     def getWeight(self, blocks) -> float:
         #return self.daa.next_weight((x.timestamp, x.weight) for x in blocks)
@@ -232,6 +255,34 @@ class Manager:
         for miner in self.miners:
             miner.stop()
 
+    def get_next_block_dt(self, weight, hashrate):
+        if weight > 40:
+            method = 'too_small'
+            # p = 2**(-weight)
+            # u = random.random()
+            # Using the inverse transform sampling: attempts = log(u) / log(1 - p)
+            # As p is really small, from the Taylor Series: log(1 - p) = -p
+            # Thus, attempts = log(u) / (-2**(-weight)) = (2**weight) * (-log(u))
+            attempts = (2**weight) * (-log(random.random()))
+        else:
+            method = 'geometric'
+            geometric_p = 2**(-weight)
+            attempts = numpy.random.geometric(geometric_p)
+        dt = attempts / hashrate
+        assert dt > 0, 'dt={} method={} attempts={} hashrate={}'.format(dt, method, attempts, hashrate)
+        return dt
+
+    def get_miner_next_block(self, miner):
+        weight = self.getWeight(miner.best_block.get_blockchain())
+        dt = self.get_next_block_dt(weight, miner.hashrate)
+        if self.weight_decay:
+            max_k = 300
+            while dt > max_k * self.target:
+                weight -= 2.73
+                dt = max_k * self.target + self.get_next_block_dt(weight, miner.hashrate)
+                max_k += 60
+        return weight, dt
+
     def run(self, interval: float, *, until_ev_type = None, show_progress: bool = False) -> None:
         if show_progress:
             if interval > 3600 * 24:
@@ -251,7 +302,7 @@ class Manager:
             if event.active:
                 if show_progress:
                     pbar.update((event.seconds - self._seconds) / factor)
-                assert event.seconds > self._seconds
+                assert event.seconds > self._seconds, '{} should be higher than {} (ev={})'.format(self._seconds, event.seconds, event)
                 self._seconds = event.seconds
                 event.run()
                 if event.ev_type == until_ev_type:
