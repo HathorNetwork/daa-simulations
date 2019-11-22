@@ -78,7 +78,7 @@ class HTR(DAA):
         dt = blocks[-1].timestamp - blocks[0].timestamp
         if dt < 1:
             dt = 1
-        #assert dt > 0
+        # assert dt > 0
 
         logH = 0.0
         for blk in blocks:
@@ -114,7 +114,6 @@ class LWMA(DAA):
         self.n = self.N if n is None else n
 
     def _get_solvetimes_and_diffs(self, blocks: Iterator['Block']) -> List[Tuple[int, int]]:
-        from itertools import accumulate
         blocks = take(blocks, self.n + 1)[::-1]
         solvetimes = [b1.timestamp - b0.timestamp for b1, b0 in zip(blocks[1:], blocks[:-1])]
         diffs = list(map(weight_to_diff, (blk.weight for blk in blocks)))
@@ -157,7 +156,7 @@ class LWMA(DAA):
             sum_diff += difficulty
 
         harmonic_mean_diff = N / sum_inverse_diff
-        arithmetic_mean_diff = sum_diff  / N
+        arithmetic_mean_diff = sum_diff / N
         if self.harmonic:
             mean_diff = harmonic_mean_diff
         else:
@@ -172,8 +171,8 @@ class LWMA(DAA):
         # next_diff = max(prev_diff * 0.8, min(prev_diff / 0.8, next_diff))
         next_difficulty = int(next_diff)
 
-        #if next_difficulty == 0:
-        #    return self.MIN_WEIGHT
+        # if next_difficulty == 0:
+        #     return self.MIN_WEIGHT
         next_weight = diff_to_weight(next_difficulty)
         if self.debug:
             print(next_weight, next_difficulty, int(harmonic_mean_diff), LWMA)
@@ -228,7 +227,6 @@ class MSB(LWMA):
     S = 5
 
     def _get_solvetimes_and_weights(self, blocks: Iterator['Block']) -> List[Tuple[int, int]]:
-        from itertools import accumulate
         blocks = take(blocks, self.n + 1)[::-1]
         solvetimes = [b1.timestamp - b0.timestamp for b1, b0 in zip(blocks[1:], blocks[:-1])]
         diffs = list(blk.weight for blk in blocks)
@@ -236,7 +234,6 @@ class MSB(LWMA):
 
     def next_weight(self, blocks: Iterator[Tuple[int, float]]) -> float:
         import math
-        from utils import sum_weights
 
         solvetimes_and_weights = self._get_solvetimes_and_weights(blocks)
 
@@ -253,7 +250,7 @@ class MSB(LWMA):
         # Otherwise make sure solvetimes and difficulties are correct size.
         else:
             assert len(solvetimes) == len(weights) == N
-        #total_solvetimes = sum(solvetimes)
+        # total_solvetimes = sum(solvetimes)
 
         K = N // 2
 
@@ -269,24 +266,24 @@ class MSB(LWMA):
             solvetime = solvetimes[i]
             weight = weights[i]
 
-            #x = sum(solvetimes[i - K:i + 1]) / K
-            #assert sum(solvetimes[i - K:i + 1]) == prefix_sum_solvetimes[i + 1] - prefix_sum_solvetimes[i - K]
+            # x = sum(solvetimes[i - K:i + 1]) / K
+            # assert sum(solvetimes[i - K:i + 1]) == prefix_sum_solvetimes[i + 1] - prefix_sum_solvetimes[i - K]
             x = (prefix_sum_solvetimes[i + 1] - prefix_sum_solvetimes[i - K]) / K
 
             ki = K * (x - self.T)**2 / (2 * self.T * self.T)
             ki = max(1, ki / self.S)
             if self.debug and ki > 1:
-                print('outlier!!!', i, ki, x) #solvetime, weight, i)
-            #ki = i - K + 2
+                print('outlier!!!', i, ki, x)  # solvetime, weight, i)
+            # ki = i - K + 2
             sum_diffs += ki * weight_to_diff(weight)
             sum_solvetimes += ki * solvetime
 
         weight = math.log(sum_diffs, 2) - math.log(sum_solvetimes, 2) + math.log(self.T, 2)
 
         # apply a maximum change in weight
-        #weight = self.apply_max_dw(weight, prev_weight)
+        # weight = self.apply_max_dw(weight, prev_weight)
 
         # apply min weight
-        #weight = self.apply_min_weight(weight)
+        # weight = self.apply_min_weight(weight)
 
         return weight

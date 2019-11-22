@@ -14,5 +14,5 @@ save_to = '{}.png'.format(os.path.splitext(filename)[0])
 managers = pickle.load(open(filename, 'rb'))
 if not isinstance(managers, list):
     managers = [managers]
-utils.plot_difficulty(managers, min_timestamp=min_timestamp, save_to=save_to)
+utils.plot_difficulty(managers, min_timestamp=min_timestamp, save_to=save_to, highlight_miner='Miner51Attack 4')
 os.system('open {}'.format(save_to))

@@ -7,7 +7,6 @@ from math import log
 from typing import NamedTuple
 
 import numpy.random
-
 from utils import sum_weights
 
 
@@ -111,11 +110,12 @@ class Miner:
             weight=weight,
             miner=self.name,
             height=height,
-            parent=parent,logwork=logwork
+            parent=parent,
+            logwork=logwork,
         )
 
         self.block_timer = self.manager.callLater(EventType.NEW_BLOCK, dt, self.on_block_found, block)
-    
+
     def on_new_best_block(self, new_best_block):
         self.best_block = new_best_block
 
@@ -130,7 +130,16 @@ class Miner:
 
         if not propagated and not self.is_quiet:
             dt = block.timestamp - block.parent.timestamp
-            print('[{}] New block found: hash={} height={:4d} ts={:8.2f} dt={:6.2f} weight={:8.4f} logwork={:8.4f}'.format(self.name, block.hash, block.height, block.timestamp, dt, block.weight, block.logwork))
+            print('[{}] New block found: hash={} height={:4d} ts={:8.2f}'
+                  'dt={:6.2f} weight={:8.4f} logwork={:8.4f}'.format(
+                      self.name,
+                      block.hash,
+                      block.height,
+                      block.timestamp,
+                      dt,
+                      block.weight,
+                      block.logwork
+                  ))
 
         self.known_blocks[block.hash] = block
         if block.logwork > self.best_block.logwork:
@@ -146,7 +155,8 @@ class Miner:
     def propagate_block(self, block) -> None:
         for neighbor in self.get_neighbors():
             dt = neighbor.get_random_delay()
-            self.manager.callLater(EventType.BLOCK_PROPAGATION, dt, neighbor.miner.on_block_found, block, propagated=True)
+            self.manager.callLater(EventType.BLOCK_PROPAGATION, dt, neighbor.miner.on_block_found,
+                                   block, propagated=True)
 
 
 class Miner51Attack(Miner):
@@ -184,6 +194,7 @@ class Miner51Attack(Miner):
         for block in self.buffer:
             self.propagate_block(block)
 
+
 class Manager:
     def __init__(self, daa, *, weight_decay=False):
         self.miners = []
@@ -206,13 +217,12 @@ class Manager:
         self.weight_decay = weight_decay
 
     def getWeight(self, blocks) -> float:
-        #return self.daa.next_weight((x.timestamp, x.weight) for x in blocks)
         return self.daa.next_weight(blocks)
 
     def seconds(self) -> int:
         return self._seconds
 
-    def callLater(self, ev_type, delay, fn, *args, **kwargs) -> 'IDelayedCall':
+    def callLater(self, ev_type, delay, fn, *args, **kwargs) -> DelayedCall:
         event = DelayedCall(ev_type, self.seconds() + delay, fn, args, kwargs)
         heapq.heappush(self.events, event)
         return event
@@ -283,7 +293,7 @@ class Manager:
                 max_k += 60
         return weight, dt
 
-    def run(self, interval: float, *, until_ev_type = None, show_progress: bool = False) -> None:
+    def run(self, interval: float, *, until_ev_type: EventType = None, show_progress: bool = False) -> None:
         if show_progress:
             if interval > 3600 * 24:
                 factor = 3600 * 24  # day
@@ -302,7 +312,7 @@ class Manager:
             if event.active:
                 if show_progress:
                     pbar.update((event.seconds - self._seconds) / factor)
-                assert event.seconds > self._seconds, '{} should be higher than {} (ev={})'.format(self._seconds, event.seconds, event)
+                assert event.seconds >= self._seconds, '{} < {} (ev={})'.format(self._seconds, event.seconds)
                 self._seconds = event.seconds
                 event.run()
                 if event.ev_type == until_ev_type:

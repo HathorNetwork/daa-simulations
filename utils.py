@@ -37,12 +37,14 @@ def all_blocks_per_miner(miner):
         d[block.miner] += 1
     return d
 
+
 def best_blockchain_per_miner(manager):
     miner = manager.miners[0]
     d = defaultdict(int)
     for block in miner.best_block.get_blockchain():
         d[block.miner] += 1
     return d
+
 
 def blocks_per_miner(it):
     d = defaultdict(int)
@@ -51,19 +53,27 @@ def blocks_per_miner(it):
     return d
 
 
-def _plot_difficulty(manager, *, min_timestamp=0):
+def _plot_difficulty(manager, *, min_timestamp=0, highlight_miner=None):
     miner = manager.miners[0]
     x_factor = 3600 * 24   # days
 
     import matplotlib.pyplot as plt
     x_values = []
     y_values = []
+    x2_values = []
+    y2_values = []
     for block in miner.best_block.get_blockchain():
         if block.timestamp < min_timestamp:
             continue
-        x_values.append(block.timestamp / x_factor)
-        y_values.append(block.weight - log(manager.target, 2))
+        if block.miner == highlight_miner:
+            x2_values.append(block.timestamp / x_factor)
+            y2_values.append(block.weight - log(manager.target, 2))
+        else:
+            x_values.append(block.timestamp / x_factor)
+            y_values.append(block.weight - log(manager.target, 2))
     plt.scatter(x_values, y_values, marker='.')
+    if x2_values:
+        plt.scatter(x2_values, y2_values, marker='x')
 
     v = []
     for timestamp, hashrate in sorted(manager.total_hashrate_history.items()):
@@ -86,7 +96,7 @@ def _plot_number_of_blocks(manager):
     plt.plot([0, manager.seconds() / x_factor], [0, manager.seconds() / manager.target], 'k')
 
 
-def plot_difficulty(managers, *, min_timestamp=0, save_to=None):
+def plot_difficulty(managers, *, min_timestamp=0, save_to=None, highlight_miner=None):
     import matplotlib.pyplot as plt
 
     print('Total: {} loops'.format(len(managers)))
@@ -103,7 +113,7 @@ def plot_difficulty(managers, *, min_timestamp=0, save_to=None):
     plt.minorticks_on()
     plt.grid(which='both', linewidth=0.25, linestyle='--')
     for manager in managers:
-        _plot_difficulty(manager, min_timestamp=min_timestamp)
+        _plot_difficulty(manager, min_timestamp=min_timestamp, highlight_miner=highlight_miner)
 
     plt.subplot(grid[3, 0])
     plt.ylabel('Blocks')

@@ -22,7 +22,7 @@ def run_flat(manager):
     manager.run(inf)
     return manager
 
-def run_51attack(manager, p=0.9):
+def run_51attack_90(manager, p=0.9):
     manager.start()
     manager.addMiner(Miner(15 * 2**40, is_quiet=True))
     manager.addMiner(Miner(30 * 2**40, is_quiet=True))
@@ -39,14 +39,17 @@ def run_51attack(manager, p=0.9):
     manager.run(3600 * 24 * 1, show_progress=True)
     attacker.stop_attack()
     attacker.stop()
-    manager.run(3600, show_progress=True)
+    manager.run(3600 * 24 * 1, show_progress=True)
 
     manager.stop()
     manager.run(inf)
     return manager
 
-def run_51attack_fail(manager):
-    return run_51attack(manager, p=0.1)
+def run_51attack_10(manager):
+    return run_51attack_90(manager, p=0.1)
+
+def run_51attack_50(manager):
+    return run_51attack_90(manager, p=0.50)
 
 def run_4x(manager):
     manager.start()
@@ -96,8 +99,9 @@ profile_choices = dict((f.__name__, f) for f in [
     run_w60,
     run_w70,
     run_flat,
-    run_51attack,
-    run_51attack_fail,
+    run_51attack_90,
+    run_51attack_50,
+    run_51attack_10,
 ])
 
 def main():
@@ -108,6 +112,7 @@ def main():
     parser.add_argument('--reset', action='store_true', help='overwrite previous results')
     parser.add_argument('--weight-decay', action='store_true', help='allow weight decay')
     parser.add_argument('--solo', action='store_true', help='run and skip saving')
+    parser.add_argument('--highlight-miner', help='miner to be highlighted')
     args = parser.parse_args()
 
     daa = daa_choices[args.daa]()
@@ -139,7 +144,7 @@ def main():
         print('Saved to {} (total={} loops)'.format(filename, len(managers)))
 
     img_filename = '{}.png'.format(basename)
-    utils.plot_difficulty(managers, save_to=img_filename)
+    utils.plot_difficulty(managers, save_to=img_filename, highlight_miner=args.highlight_miner)
     os.system('open {}'.format(img_filename))
 
 
