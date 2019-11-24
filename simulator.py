@@ -67,7 +67,6 @@ class Block(NamedTuple):
 
 class Miner:
     counter = 1
-    name_prefix = 'Miner'
 
     def __init__(self, hashrate: int, *, is_quiet: bool = False) -> None:
         self.hashrate = hashrate
@@ -75,7 +74,7 @@ class Miner:
         self.known_blocks = {}   # Dict[int, Block]
         self.best_block = None
         self.neighbors = []
-        self.name = '{} {}'.format(self.name_prefix, Miner.counter)
+        self.name = '{} {}'.format(self.__class__.__name__, Miner.counter)
         self.block_timer = None
         self.is_running = False
         self.is_quiet = is_quiet
@@ -96,14 +95,17 @@ class Miner:
     def get_blocks(self):
         return self.known_blocks.values()
 
+    def get_next_block_timestamp(self, parent, dt):
+        seconds = self.manager.seconds()
+        return max(int(seconds + dt), parent.timestamp + 1)
+
     def schedule_next_block(self) -> None:
         weight, dt = self.manager.get_miner_next_block(self)
 
-        seconds = self.manager.seconds()
         parent = self.best_block
         height = parent.height + 1
         logwork = sum_weights(parent.logwork, weight)
-        timestamp = max(int(seconds + dt), parent.timestamp + 1)
+        timestamp = self.get_next_block_timestamp(parent, dt)
         block = Block(
             hash=random.getrandbits(256),
             timestamp=timestamp,
@@ -157,6 +159,19 @@ class Miner:
             dt = neighbor.get_random_delay()
             self.manager.callLater(EventType.BLOCK_PROPAGATION, dt, neighbor.miner.on_block_found,
                                    block, propagated=True)
+
+
+class MinerMinimumTimestamp(Miner):
+    def get_next_block_timestamp(self, parent, dt):
+        return parent.timestamp + 1
+
+
+class MinerDoubleAvgTimestamp(Miner):
+    def get_next_block_timestamp(self, parent, dt):
+        return parent.timestamp + 10 * self.manager.target
+
+    def on_new_best_block(self, new_best_block):
+        super().on_new_best_block(new_best_block)
 
 
 class Miner51Attack(Miner):

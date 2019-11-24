@@ -284,6 +284,6 @@ class MSB(LWMA):
         # weight = self.apply_max_dw(weight, prev_weight)
 
         # apply min weight
-        # weight = self.apply_min_weight(weight)
+        weight = max(weight, self.MIN_WEIGHT)
 
         return weight

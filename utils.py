@@ -147,16 +147,18 @@ def mining_stats(managers, save_to=None):
         for x in names:
             miner = miners[x]
             print('{}'.format(x))
-            print('  log(H) = {:.6f}'.format(log(miner.hashrate, 2)))
+            print('  log(H) = {:.6f} frac={:.6f}'.format(
+                log(miner.hashrate, 2),
+                hashes_percent.get(x, 0),
+            ))
             print('  best block height={} weight={} logwork={}'.format(
                 miner.best_block.height,
                 miner.best_block.weight,
-                miner.best_block.logwork)
-            )
-            print('  {} blocks ({:.6f}) expected={:.6f}'.format(
+                miner.best_block.logwork,
+            ))
+            print('  {} blocks ({:.6f})'.format(
                 blocks.get(x, 0),
                 blocks_percent.get(x, 0),
-                hashes_percent.get(x, 0),
             ))
             total_orphans = len(list(get_orphans(miner)))
             print('  {} orphan blocks'.format(total_orphans))

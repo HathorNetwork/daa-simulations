@@ -6,7 +6,7 @@ from math import ceil, inf
 
 import utils
 from difficulty import CRAZY, HTR, LWMA, MSB
-from simulator import EventType, Manager, Miner, Miner51Attack
+from simulator import EventType, Manager, Miner, Miner51Attack, MinerDoubleAvgTimestamp
 
 sys.setrecursionlimit(10000)
 
@@ -18,8 +18,16 @@ def run_flat(manager):
     manager.addMiner(Miner(30 * 2**40, is_quiet=True))
     manager.addMiner(Miner(45 * 2**40, is_quiet=True))
     manager.run(3600 * 24 * 5, show_progress=True)
-    manager.stop()
-    manager.run(inf)
+    return manager
+
+def run_ts_tampering(manager):
+    manager.start()
+    manager.addMiner(Miner(25 * 2**40, is_quiet=True))
+    manager.addMiner(Miner(30 * 2**40, is_quiet=True))
+    manager.addMiner(Miner(45 * 2**40, is_quiet=True))
+    manager.run(3600 * 24, show_progress=True)
+    manager.addMiner(MinerDoubleAvgTimestamp(10 * 2**40, is_quiet=True))
+    manager.run(3600 * 24 * 4, show_progress=True)
     return manager
 
 def run_51attack_90(manager, p=0.9):
@@ -41,8 +49,6 @@ def run_51attack_90(manager, p=0.9):
     attacker.stop()
     manager.run(3600 * 24 * 1, show_progress=True)
 
-    manager.stop()
-    manager.run(inf)
     return manager
 
 def run_51attack_10(manager):
@@ -102,6 +108,7 @@ profile_choices = dict((f.__name__, f) for f in [
     run_51attack_90,
     run_51attack_50,
     run_51attack_10,
+    run_ts_tampering,
 ])
 
 def main():
