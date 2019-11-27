@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::binary_heap::BinaryHeap;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap, HashSet, LinkedList};
 use std::fmt;
 use std::fmt::Debug;
 use std::error::Error;
@@ -10,6 +9,7 @@ use std::fs::File;
 use env_logger::Env;
 use log::LevelFilter;
 use log::{error, info, trace, warn};
+use maplit::*;
 use noisy_float::prelude::*;
 use petgraph::prelude::*;
 use plotters::coord::Shift;
@@ -22,17 +22,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
-use self::ScheduleEvent::*;
-
-type DynEvent = Box<dyn Event>;
-type DynDaa = Box<dyn Daa>;
-type DynMiner = Box<dyn Miner>;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-enum ScheduleEvent {
-    LocalDelay(f64, DynEvent),
-    NetworkPropagate(DynEvent),
-}
+type BoxedDaa = Box<dyn Daa>;
+type BoxedMiner = Box<dyn Miner>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
@@ -40,7 +31,7 @@ struct Config {
     initial_weight: f64,
     min_weight: f64,
     weight_decay: bool,
-    daa: DynDaa,
+    daa: BoxedDaa,
 }
 
 impl Default for Config {
@@ -50,7 +41,7 @@ impl Default for Config {
             initial_weight: 50.,
             min_weight: 21.,
             weight_decay: true,
-            daa: Box::new(NoDaa),
+            daa: Box::new(<Htr as Default>::default()),
         }
     }
 }
@@ -61,16 +52,36 @@ impl Config {
     }
 }
 
-#[typetag::serde]
-trait Event: Debug + objekt::Clone + Send + Sync {
-    /// event has mutable access to the manager and returns list of tuples of (delay, next_event)
-    fn step(self: Box<Self>, node: &mut Node, config: &Config) -> Vec<ScheduleEvent>;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum Event {
+    MineBlock {
+        delay: f64,
+        block: BlockWithMetadata,
+        mining_job_uid: u64,
+    },
+    PropagateBlock(BlockWithMetadata),
+    TakeMeasurements,
 }
-objekt::clone_trait_object!(Event);
+
+impl Event {
+    fn delay(&self) -> Option<f64> {
+        if let &Event::MineBlock { delay, .. } = self {
+            Some(delay)
+        } else {
+            None
+        }
+    }
+}
+
+struct DaaContext<'a> {
+    node: &'a Node,
+    config: &'a Config,
+    known_blocks: &'a HashMap<Hash, BlockWithMetadata>,
+}
 
 #[typetag::serde]
 trait Daa: Debug + objekt::Clone + Send + Sync {
-    fn next_weight(&self, node: &Node, config: &Config) -> R64;
+    fn next_weight(&self, ctx: DaaContext) -> R64;
 }
 objekt::clone_trait_object!(Daa);
 
@@ -130,9 +141,9 @@ impl LogSub for R64 {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ScheduledEvent {
     uid: u64,
-    node_idx: NodeIndex,
+    node_idx: Option<NodeIndex>,
     timestamp: R64,
-    event: DynEvent,
+    event: Event,
 }
 
 impl Ord for ScheduledEvent {
@@ -209,8 +220,8 @@ struct BlockMetadata {
     hash: Hash,
     height: u64,
     solvetime: u32,
-    acc_work_weight: R64,
-    mined_by: String,
+    logwork: R64,
+    mined_by: NodeIndex,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -227,9 +238,35 @@ impl BlockWithMetadata {
                 hash: Hash::null(),
                 height: 0,
                 solvetime: 0,
-                acc_work_weight: r64(config.initial_weight),
-                mined_by: "genesis".into(),
+                logwork: r64(config.initial_weight),
+                mined_by: 0.into(),
             },
+        }
+    }
+
+    /// iteretate over the best chain, starting from the current block
+    fn iter_blockchain<'a>(&self, known_blocks: &'a HashMap<Hash, BlockWithMetadata>) -> impl Iterator<Item = &'a BlockWithMetadata> {
+        IterChain { known_blocks, current_hash: self.metadata.hash }
+    }
+}
+
+#[derive(Debug)]
+struct IterChain<'a> {
+    known_blocks: &'a HashMap<Hash, BlockWithMetadata>,
+    current_hash: Hash,
+}
+
+impl<'a> std::iter::Iterator for IterChain<'a> {
+    type Item = &'a BlockWithMetadata;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_hash == Hash::null() {
+            None
+        } else if let Some(block) = self.known_blocks.get(&self.current_hash) {
+            self.current_hash = block.block.parent_hash;
+            Some(block)
+        } else {
+            error!("blockchain ended before reaching genesis");
+            None
         }
     }
 }
@@ -271,18 +308,19 @@ impl Default for Edge {
 #[typetag::serde]
 trait Miner: Debug + objekt::Clone + Send + Sync {
     // H/s TODO: use PH/s for more real world values
-    fn hashrate(&self, node: &Node) -> f64;
+    fn hashrate(&mut self) -> f64 { self.hashrate_peek() }
+    fn hashrate_peek(&self) -> f64;
 }
 objekt::clone_trait_object!(Miner);
 
 #[derive(Debug, Clone)]
 struct NodeTemplate {
     name_template: &'static str,
-    miner: Option<DynMiner>,
+    miner: Option<BoxedMiner>,
 }
 
 impl NodeTemplate {
-    fn new(name_template: &'static str, miner: Option<DynMiner>) -> NodeTemplate {
+    fn new(name_template: &'static str, miner: Option<BoxedMiner>) -> NodeTemplate {
         NodeTemplate {
             name_template,
             miner,
@@ -290,35 +328,36 @@ impl NodeTemplate {
     }
     fn create_node(&self, node_idx: u32, config: &Config) -> Node {
         Node {
+            idx: Default::default(),
             name: format!("{} {}", self.name_template, node_idx),
             miner: self.miner.clone(),
-            known_blocks: HashMap::new(),
             mining_job_uid: 0,
             timestamp: 0.0,
             tip: BlockWithMetadata::genesis(config),
+            blocks_seen: hashset!{Hash::null()},
         }
     }
 }
 
-fn sample_solvetime<R: Rng>(rng: &mut R, hashrate: f64, rweight: R64) -> u32 {
+fn sample_solvetime<R: Rng>(rng: &mut R, hashrate: f64, rweight: R64, target_solvetime: u32) -> u32 {
     use rand::distributions::Open01;
     // sample how many tries are needed to solve at the current difficulty weight
     let uniform: f64 = rng.sample(Open01);
     //let trials = 2.0f64.powf(rweight.raw()) * -uniform.ln();
     let geom_p = 2.0f64.powf(-rweight.raw());
     let trials = uniform.ln() / (-geom_p).ln_1p();
-    let solvetime = ((trials / hashrate) as u32).max(1);
-    solvetime
+    (target_solvetime as f64 * trials / hashrate) as u32
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Node {
     name: String,
-    miner: Option<DynMiner>,
-    known_blocks: HashMap<Hash, BlockWithMetadata>,
+    idx: NodeIndex,
+    miner: Option<BoxedMiner>,
     mining_job_uid: u64,
     timestamp: f64,
     tip: BlockWithMetadata,
+    blocks_seen: HashSet<Hash>,
 }
 
 impl Node {
@@ -326,112 +365,48 @@ impl Node {
         self.tip.metadata.height
     }
 
-    /// iteretate over the best chain, starting from tip
-    fn iter_blockchain(&self) -> impl Iterator<Item = &BlockWithMetadata> {
-        self.iter_blockchain_from(self.tip.metadata.hash)
-    }
-
-    /// iteretate over the parents block, starting from the given hash
-    fn iter_blockchain_from(&self, block_hash: Hash) -> impl Iterator<Item = &BlockWithMetadata> {
-        #[derive(Debug)]
-        struct IterChain<'a> {
-            known_blocks: &'a HashMap<Hash, BlockWithMetadata>,
-            current_hash: Hash,
-        }
-        impl<'a> std::iter::Iterator for IterChain<'a> {
-            type Item = &'a BlockWithMetadata;
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.current_hash == Hash::null() {
-                    None
-                } else if let Some(block) = self.known_blocks.get(&self.current_hash) {
-                    self.current_hash = block.block.parent_hash;
-                    Some(block)
-                } else {
-                    None
-                }
-            }
-        }
-        IterChain {
-            known_blocks: &self.known_blocks,
-            current_hash: block_hash,
-        }
-    }
-
-    fn create_mining_job(&self, config: &Config) -> Option<ScheduleEvent> {
-        #[derive(Serialize, Deserialize, Debug, Clone)]
-        struct MineBlockEvent {
-            block: BlockWithMetadata,
-            mining_job_uid: u64,
-        }
-        #[typetag::serde]
-        impl Event for MineBlockEvent {
-            fn step(self: Box<Self>, node: &mut Node, config: &Config) -> Vec<ScheduleEvent> {
-                if node.mining_job_uid == self.mining_job_uid {
-                    node.on_block_found(&self.block, config, false)
-                } else {
-                    // another job has been created, stop this mining chain
-                    vec![]
-                }
-            }
-        }
-        if let Some(miner) = &self.miner {
-            let hashrate = miner.hashrate(self);
+    fn create_mining_job(&mut self, config: &Config, known_blocks: &mut HashMap<Hash, BlockWithMetadata>) -> Option<Event> {
+        if let Some(ref mut miner) = self.miner {
+            let hashrate = miner.hashrate();
             let mut rng = thread_rng();
-            let new_block = self.gen_new_block(&mut rng, hashrate, config, self.name.clone());
+            let new_block = self.gen_new_block(&mut rng, hashrate, config, self.idx, known_blocks);
+            known_blocks.insert(new_block.metadata.hash, new_block.clone());
             let delay = new_block.metadata.solvetime as f64;
-            Some(LocalDelay(
-                delay,
-                Box::new(MineBlockEvent {
-                    block: new_block,
-                    mining_job_uid: self.mining_job_uid,
-                }),
-            ))
+            Some(Event::MineBlock {
+                delay: delay,
+                block: new_block,
+                mining_job_uid: self.mining_job_uid,
+            })
         } else {
             None
         }
     }
 
-    fn propagate_block_events(&self, block: &BlockWithMetadata) -> Vec<ScheduleEvent> {
-        #[derive(Serialize, Deserialize, Debug, Clone)]
-        struct PropagateBlockEvent {
-            block: BlockWithMetadata,
-        }
-        #[typetag::serde]
-        impl Event for PropagateBlockEvent {
-            fn step(self: Box<Self>, node: &mut Node, config: &Config) -> Vec<ScheduleEvent> {
-                node.on_block_found(&self.block, config, true)
-            }
-        }
-        vec![NetworkPropagate(Box::new(PropagateBlockEvent {
-            block: block.clone(),
-        }))]
-    }
-
     fn on_block_found(
         &mut self,
-        block: &BlockWithMetadata,
+        block: BlockWithMetadata,
         config: &Config,
         propagated: bool,
-    ) -> Vec<ScheduleEvent> {
+        known_blocks: &mut HashMap<Hash, BlockWithMetadata>,
+    ) -> LinkedList<Event> {
+        let mut list = LinkedList::new();
         // ignore known blocks
-        if self.known_blocks.contains_key(&block.metadata.hash) {
-            return vec![];
+        if self.blocks_seen.contains(&block.metadata.hash) {
+            return list;
         }
-        self.known_blocks.insert(block.metadata.hash, block.clone());
+        self.blocks_seen.insert(block.metadata.hash);
         // invalidate current mining job
         self.mining_job_uid += 1;
         // if blocks arrive out of order, the following assumptions may lead to a fork
         if !propagated {
             trace!("new block: {:?}", block);
         }
-        if block.metadata.acc_work_weight > self.tip.metadata.acc_work_weight {
+        if block.metadata.logwork > self.tip.metadata.logwork {
             self.tip = block.clone();
         }
-        let mut events = self.propagate_block_events(block);
-        if let Some(mining_event) = self.create_mining_job(config) {
-            events.push(mining_event);
-        }
-        events
+        list.push_back(Event::PropagateBlock(block));
+        list.extend(self.create_mining_job(config, known_blocks));
+        list
     }
 
     fn gen_new_block<R: Rng>(
@@ -439,20 +414,25 @@ impl Node {
         rng: &mut R,
         hashrate: f64,
         config: &Config,
-        name: String,
+        node_idx: NodeIndex,
+        known_blocks: &HashMap<Hash, BlockWithMetadata>,
     ) -> BlockWithMetadata {
-        let mut rweight = config.daa.next_weight(&self, config);
-        let mut solvetime = sample_solvetime(rng, hashrate, rweight);
+        let mut rweight = config.daa.next_weight(DaaContext {
+            node: &self,
+            config: config,
+            known_blocks: known_blocks,
+        });
+        let mut solvetime = sample_solvetime(rng, hashrate, rweight, config.target_solvetime);
         if config.weight_decay {
             let mut max_k = 300;
             while solvetime > max_k * config.target_solvetime {
                 rweight -= r64(2.73); // 15% of original diff
-                solvetime = sample_solvetime(rng, hashrate, rweight);
+                solvetime = max_k * config.target_solvetime + sample_solvetime(rng, hashrate, rweight, config.target_solvetime);
                 max_k += 60;
             }
         }
         let rweight = rweight;
-        let solvetime = solvetime;
+        let solvetime = solvetime.max(1);
 
         // there is at least the genesis block, unwrapping won't panic
         let parent_block = &self.tip;
@@ -471,8 +451,8 @@ impl Node {
                 hash,
                 height: parent_block.metadata.height + 1,
                 solvetime,
-                acc_work_weight: parent_block.metadata.acc_work_weight.log2_add(rweight),
-                mined_by: name,
+                logwork: parent_block.metadata.logwork.log2_add(rweight),
+                mined_by: node_idx,
             },
         };
         block_with_metadata
@@ -492,17 +472,49 @@ impl ConstantMiner {
 
 #[typetag::serde]
 impl Miner for ConstantMiner {
-    fn hashrate(&self, _node: &Node) -> f64 {
-        self.hashrate
+    fn hashrate_peek(&self) -> f64 { self.hashrate }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VariableMiner {
+    cur_hashrate: f64,
+    multiplier: f64,
+    /// 0.0 means equal chance of rising and falling, 1.0 means always rising
+    rise_bias: f64,
+}
+
+impl VariableMiner {
+    fn new(cur_hashrate: f64, multiplier: f64, rise_bias: f64) -> Box<VariableMiner> {
+        Box::new(VariableMiner { cur_hashrate, multiplier, rise_bias })
+    }
+}
+
+#[typetag::serde]
+impl Miner for VariableMiner {
+    fn hashrate(&mut self) -> f64 {
+        self.cur_hashrate
+    }
+    fn hashrate_peek(&self) -> f64 {
+        self.cur_hashrate
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct Network(StableUnGraph<Node, Edge>);
+//struct Network(StableUnGraph<Node, Edge>);
+struct Network(UnGraph<Node, Edge>);
 
 impl Network {
     fn node(&self, node_idx: NodeIndex) -> Option<&Node> {
         self.0.node_weight(node_idx)
+    }
+
+    fn nodes(&self) -> impl Iterator<Item=&Node> {
+        use petgraph::visit::IntoNodeReferences;
+        self.0.node_references().map(|(_, n)| n)
+    }
+
+    fn nodes_mut(&mut self) -> impl Iterator<Item=&mut Node> {
+        self.0.node_weights_mut()
     }
 
     fn node_mut(&mut self, node_idx: NodeIndex) -> Option<&mut Node> {
@@ -515,6 +527,8 @@ impl Network {
 
     fn add_connected_node(&mut self, node: Node) -> NodeIndex {
         let node_idx = self.0.add_node(node);
+        let mut node = self.0.node_weight_mut(node_idx).unwrap();
+        node.idx = node_idx;
         // collect so we can drop `self.network` read ref and mut it below
         let neighbors: Vec<_> = self
             .0
@@ -533,8 +547,10 @@ impl Network {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Measure {
-    actual_network_hashrate: f64,
+struct Measurement {
+    estimated_network_weight: f64,
+    best_height: u64,
+    orphan_blocks: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -546,22 +562,57 @@ struct Simulator {
     scheduled_events: BinaryHeap<ScheduledEvent>,
     network: Network,
     max_steps: u64,
-    measurements: Vec<Measure>,
+    known_blocks: HashMap<Hash, BlockWithMetadata>,
+    initial_timestamp: f64,
+    measurements: Vec<Measurement>,
+    measurement_period: f64,
 }
 
 impl Simulator {
     fn new(config: Config) -> Simulator {
+        let genesis_block = BlockWithMetadata::genesis(&config);
+        let mut scheduled_events = BinaryHeap::new();
+        scheduled_events.push(ScheduledEvent {
+            uid: 0,
+            node_idx: None,
+            timestamp: r64(0.0),
+            event: Event::TakeMeasurements,
+        });
         Simulator {
             config,
             timestamp: 0.0,
-            next_event_uid: 0,
+            next_event_uid: 1,
             next_node_uid: 0,
-            scheduled_events: BinaryHeap::new(),
+            scheduled_events,
             network: Default::default(),
             //history: vec![],
             max_steps: 1_000_000, // arbitrary
+            known_blocks: hashmap!{
+                Hash::null() => genesis_block,
+            },
+            initial_timestamp: 0.0,
             measurements: vec![],
+            measurement_period: 1.0,
         }
+    }
+
+    fn iter_measurements(&self) -> impl Iterator<Item=(f64, &Measurement)> {
+        struct StepBy {
+            cur: f64,
+            step: f64,
+        }
+        impl StepBy  {
+            fn new(start: f64, step: f64) -> StepBy { StepBy { cur: start,  step } }
+        }
+        impl Iterator for StepBy {
+            type Item = f64;
+            fn next(&mut self) -> Option<Self::Item> {
+                let ret = self.cur;
+                self.cur += self.step;
+                Some(ret)
+            }
+        }
+        StepBy::new(self.initial_timestamp, self.measurement_period).zip(self.measurements.iter())
     }
 
     fn example_node(&self) -> Option<&Node> {
@@ -574,27 +625,17 @@ impl Simulator {
             .and_then(identity)
     }
 
-    fn example_node_mut(&mut self) -> Option<&mut Node> {
-        use std::convert::identity;
-        self.network
-            .0
-            .node_indices()
-            .next()
-            .map(move |node_idx| self.network.node_mut(node_idx))
-            .and_then(identity)
-    }
-
     fn create_node(&mut self, template: &NodeTemplate) -> NodeIndex {
         let node = template.create_node(self.next_node_uid, &self.config);
         self.next_node_uid += 1;
         self.add_node(node)
     }
 
-    fn add_node(&mut self, node: Node) -> NodeIndex {
-        let mining_job = node.create_mining_job(&self.config);
+    fn add_node(&mut self, mut node: Node) -> NodeIndex {
+        let mining_job = node.create_mining_job(&self.config, &mut self.known_blocks);
         let node_idx = self.network.add_connected_node(node);
         if let Some(event) = mining_job {
-            self.schedule_event(node_idx, event);
+            self.schedule_event(Some(node_idx), event);
         }
         node_idx
     }
@@ -603,70 +644,52 @@ impl Simulator {
         self.network.remove_node(node_idx)
     }
 
-    fn schedule_event(&mut self, node_idx: NodeIndex, schedule_event: ScheduleEvent) {
+    fn schedule_all_events(&mut self, node_idx: Option<NodeIndex>, events: impl IntoIterator<Item=Event>) {
+        for schedule_event in events {
+            self.schedule_event(node_idx, schedule_event);
+        }
+    }
+
+    fn schedule_event(&mut self, node_idx: Option<NodeIndex>, event: Event) {
         let timestamp = r64(self.timestamp);
         let mut rng = thread_rng();
-        match schedule_event {
-            LocalDelay(delay, event) => {
-                trace!("local event: {:?}, delay: {}", event, delay);
+        if let Some(delay) = event.delay() {
+            self.scheduled_events.push(ScheduledEvent {
+                uid: self.next_event_uid,
+                node_idx,
+                timestamp: timestamp + delay,
+                event,
+            });
+            self.next_event_uid += 1;
+        } else if let Some(node_idx) = node_idx {
+            for (idx, edge) in self.network.edges(node_idx) {
+                let delay = edge.sample_delay(&mut rng);
                 self.scheduled_events.push(ScheduledEvent {
                     uid: self.next_event_uid,
-                    node_idx,
+                    node_idx: Some(idx),
                     timestamp: timestamp + delay,
-                    event,
+                    event: event.clone(),
                 });
                 self.next_event_uid += 1;
             }
-            NetworkPropagate(event) => {
-                for (idx, edge) in self.network.edges(node_idx) {
-                    let delay = edge.sample_delay(&mut rng);
-                    trace!(
-                        "propagate event: {:?}, from: {:?}, to: {:?}, delay: {}",
-                        event,
-                        node_idx,
-                        idx,
-                        delay
-                    );
-                    self.scheduled_events.push(ScheduledEvent {
-                        uid: self.next_event_uid,
-                        node_idx: idx,
-                        timestamp: timestamp + delay,
-                        event: event.clone(),
-                    });
-                    self.next_event_uid += 1;
-                }
-            }
+        } else {
+            unreachable!()
         }
     }
 
     fn run(&mut self, timeout: f64) {
-        self.run_until(|_| false, timeout);
-    }
-
-    fn run_until<P>(&mut self, predicate: P, timeout: f64)
-    where
-        P: FnMut(&Node) -> bool,
-    {
         let start_timestamp = self.timestamp;
-        let mut predicate = predicate;
         let mut steps = 0u64;
         loop {
+            let max_steps = self.max_steps;
             // abort the simulation if it exceeds the max number of steps
-            if steps > self.max_steps {
+            if steps > max_steps {
                 warn!("simulation stalled");
                 break;
             }
             steps += 1;
             // peek to see if we have to stop
-            let predicate_reached = if let Some(mut node) = self.example_node_mut() {
-                predicate(&mut node)
-            } else {
-                false
-            };
-            if predicate_reached {
-                trace!("predicate reached");
-                break;
-            } else if let Some(scheduled_event) = self.scheduled_events.peek() {
+            if let Some(scheduled_event) = self.scheduled_events.peek() {
                 if scheduled_event.timestamp - start_timestamp > timeout {
                     trace!("reached max simulation time");
                     break;
@@ -685,17 +708,66 @@ impl Simulator {
             {
                 trace!("run event {:?}", event);
                 self.timestamp = timestamp.raw();
-                let mut node = match self.network.node_mut(node_idx) {
-                    Some(n) => n,
-                    None => {
-                        warn!("node {:?} not found, skipping event {:?}", node_idx, event);
-                        continue;
+                let network = &mut self.network;
+                let mut some_node = node_idx.and_then(|idx| network.node_mut(idx));
+                // trace!("node {:?} not found, skipping event {:?}", node_idx, event);
+                // continue;
+                if let Some(ref mut node) = some_node {
+                    node.timestamp = self.timestamp;
+                }
+                match event {
+                    Event::MineBlock { block, mining_job_uid, .. } => {
+                        let node = if let Some(node) = some_node { node } else {
+                            trace!("node {:?} not found, Event::MineBlock requires node", node_idx);
+                            continue;
+                        };
+                        if node.mining_job_uid == mining_job_uid {
+                            let next_events = node.on_block_found(block, &self.config, false, &mut self.known_blocks);
+                            let node_idx = node.idx;
+                            drop(node);
+                            drop(network);
+                            self.schedule_all_events(Some(node_idx), next_events);
+                        }
                     }
-                };
-                node.timestamp = self.timestamp;
-                let next_events = event.step(&mut node, &self.config);
-                for schedule_event in next_events {
-                    self.schedule_event(node_idx, schedule_event);
+                    Event::PropagateBlock(block) => {
+                        let node = if let Some(node) = some_node { node } else {
+                            trace!("node {:?} not found, Event::PropagateBlock requires node", node_idx);
+                            continue;
+                        };
+                        let next_events = node.on_block_found(block, &self.config, true, &mut self.known_blocks);
+                        let node_idx = node.idx;
+                        drop(node);
+                        drop(network);
+                        self.schedule_all_events(Some(node_idx), next_events);
+                    }
+                    Event::TakeMeasurements => {
+                        // estimate network hashrate
+                        let mut iweights = network.nodes()
+                            .filter(|node| node.miner.is_some())
+                            .map(|node| node.miner.as_ref().unwrap().hashrate_peek().log2());
+                        let some_weight = iweights.next();
+                        let estimated_network_weight = if let Some(weight) = some_weight {
+                            iweights.fold(weight, |w1, w2| w1.log2_add(w2))
+                        } else { 0.0 };
+                        // find best height: height of the best chain among all nodes
+                        let best_block = network.nodes().map(|n| &n.tip).max_by_key(|b| b.metadata.logwork).unwrap(); // every node has at least the genesis, unwrap is safe
+                        let best_height = best_block.metadata.height;
+                        // total number of orphan blocks so far
+                        let orphan_blocks = self.known_blocks.len() as u64 - best_height;
+                        // save measurement
+                        self.measurements.push(Measurement {
+                            estimated_network_weight,
+                            best_height,
+                            orphan_blocks,
+                        });
+                        self.scheduled_events.push(ScheduledEvent {
+                            uid: self.next_event_uid,
+                            node_idx: None,
+                            timestamp: timestamp + self.measurement_period,
+                            event: Event::TakeMeasurements,
+                        });
+                        self.next_event_uid += 1;
+                    }
                 }
             }
         }
@@ -703,12 +775,22 @@ impl Simulator {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct NoDaa;
+struct ConstantDaa {
+    weight: R64,
+}
+
+impl Default for ConstantDaa {
+    fn default() -> Self {
+        ConstantDaa {
+            weight: r64(63.5),
+        }
+    }
+}
 
 #[typetag::serde]
-impl Daa for NoDaa {
-    fn next_weight(&self, node: &Node, _config: &Config) -> R64 {
-        node.tip.block.rweight
+impl Daa for ConstantDaa {
+    fn next_weight(&self, _ctx: DaaContext) -> R64 {
+        self.weight
     }
 }
 
@@ -729,24 +811,24 @@ impl Default for Htr {
 
 #[typetag::serde]
 impl Daa for Htr {
-    fn next_weight(&self, node: &Node, config: &Config) -> R64 {
+    fn next_weight(&self, ctx: DaaContext) -> R64 {
         use std::cmp::min;
 
-        let height = node.height();
+        let height = ctx.node.height();
         if height < 3 {
-            return r64(config.initial_weight);
+            return r64(ctx.config.initial_weight);
         }
 
         let n = min(self.window_size, height) as usize;
-        let tip = &node.tip;
-        let tail = node.iter_blockchain().skip(n - 1).next().unwrap();
+        let tip = &ctx.node.tip;
+        let tail = ctx.node.tip.iter_blockchain(ctx.known_blocks).skip(n - 1).next().unwrap();
         trace!("tip: {:?}, tail: {:?}", tip, tail);
         let dt = (tip.block.timestamp - tail.block.timestamp) as f64;
         let logwork = tip
             .metadata
-            .acc_work_weight
-            .log2_sub(tail.metadata.acc_work_weight);
-        let weight = logwork - dt.log2() + (config.target_solvetime as f64).log2();
+            .logwork
+            .log2_sub(tail.metadata.logwork);
+        let weight = logwork - dt.log2() + (ctx.config.target_solvetime as f64).log2();
 
         // adjust max change in weight if configured
         if let Some(max_dw) = self.max_dw {
@@ -784,16 +866,16 @@ impl Default for SimpExp {
 
 #[typetag::serde]
 impl Daa for SimpExp {
-    fn next_weight(&self, node: &Node, config: &Config) -> R64 {
-        let tip = &node.tip;
+    fn next_weight(&self, ctx: DaaContext) -> R64 {
+        let tip = &ctx.node.tip;
         if tip.metadata.height < 1 {
-            return r64(config.initial_weight);
+            return r64(ctx.config.initial_weight);
         }
         let height_from_genesis = self.h + tip.metadata.height as f64;
         let time_since_genesis = tip.block.timestamp as f64;
-        let target_solvetime = config.target_solvetime as f64;
+        let target_solvetime = ctx.config.target_solvetime as f64;
         let next_weight = self.k * (height_from_genesis - time_since_genesis / target_solvetime);
-        let next_weight = next_weight.max(config.min_weight);
+        let next_weight = next_weight.max(ctx.config.min_weight);
         r64(next_weight)
     }
 }
@@ -817,19 +899,19 @@ impl Default for Lwma {
 
 #[typetag::serde]
 impl Daa for Lwma {
-    fn next_weight(&self, node: &Node, config: &Config) -> R64 {
+    fn next_weight(&self, ctx: DaaContext) -> R64 {
         use std::cmp::min;
-        let height = node.height();
+        let height = ctx.node.height();
         if height < 3 {
-            return r64(config.initial_weight);
+            return r64(ctx.config.initial_weight);
         }
         let n = min(self.window_size, height - 1) as usize;
         let k = 2.0f64 / ((n * (n + 1)) as f64);
         let mut lwma_solvetimes = 0.0f64;
         let mut log_sum_inv_weight: Option<f64> = None;
         let mut log_sum_weight: Option<f64> = None;
-        let solvetimes_and_weights = node
-            .iter_blockchain()
+        let solvetimes_and_weights = ctx.node.tip
+            .iter_blockchain(ctx.known_blocks)
             .take(n)
             .map(|b| (b.metadata.solvetime, b.block.weight()));
         for (i, (solvetime, weight)) in solvetimes_and_weights.enumerate() {
@@ -854,8 +936,8 @@ impl Daa for Lwma {
             arithmetic_mean_weight
         };
         let next_weight =
-            mean_weight + (config.target_solvetime as f64).log2() - lwma_solvetimes.log2();
-        let next_weight = next_weight.max(config.min_weight);
+            mean_weight + (ctx.config.target_solvetime as f64).log2() - lwma_solvetimes.log2();
+        let next_weight = next_weight.max(ctx.config.min_weight);
         r64(next_weight)
     }
 }
@@ -881,30 +963,30 @@ impl Default for Msb {
 
 #[typetag::serde]
 impl Daa for Msb {
-    fn next_weight(&self, node: &Node, config: &Config) -> R64 {
+    fn next_weight(&self, ctx: DaaContext) -> R64 {
         use std::cmp::min;
-        let height = node.height();
+        let height = ctx.node.height();
         if height < 10 {
-            return r64(config.initial_weight);
+            return r64(ctx.config.initial_weight);
         }
         let n = min(self.window_size, height - 1) as usize;
         let k = n / 2;
-        let kx = (k as f64) / (2 * config.target_solvetime.pow(2)) as f64;
+        let kx = (k as f64) / (2 * ctx.config.target_solvetime.pow(2)) as f64;
         let mut sum_diffs = 0.0;
         let mut log_sum_weight: Option<f64> = None;
         let mut sum_solvetimes = 0.0;
         let mut prefix_sum_diffs = vec![0.0];
-        let solvetimes = node.iter_blockchain().take(n).map(|b| b.metadata.solvetime);
+        let solvetimes = ctx.node.tip.iter_blockchain(ctx.known_blocks).take(n).map(|b| b.metadata.solvetime);
         for solvetime in solvetimes {
             prefix_sum_diffs.push(prefix_sum_diffs.last().unwrap() + solvetime as f64);
         }
-        let solvetimes_and_weights = node
-            .iter_blockchain()
+        let solvetimes_and_weights = ctx.node.tip
+            .iter_blockchain(ctx.known_blocks)
             .take(k)
             .map(|b| (b.metadata.solvetime, b.block.weight()));
         for (i, (solvetime, weight)) in solvetimes_and_weights.enumerate() {
             let x = (prefix_sum_diffs[i + k] - prefix_sum_diffs[i + 1]) / k as f64;
-            let ki = kx * (x - config.target_solvetime as f64).powi(2);
+            let ki = kx * (x - ctx.config.target_solvetime as f64).powi(2);
             let ki = 1.0.max((ki / self.sigma_adjust).ceil());
             if ki > 1.0 {
                 trace!("outlier!!! {} {} {}", i, ki, x);
@@ -918,9 +1000,9 @@ impl Daa for Msb {
             });
             sum_solvetimes += ki * solvetime as f64;
         }
-        //let next_weight = log_sum_weight.unwrap() - sum_solvetimes.log2() + config.target_solvetime_log2();
-        let next_weight = sum_diffs.log2() - sum_solvetimes.log2() + config.target_solvetime_log2();
-        let next_weight = next_weight.max(config.min_weight);
+        //let next_weight = log_sum_weight.unwrap() - sum_solvetimes.log2() + ctx.config.target_solvetime_log2();
+        let next_weight = sum_diffs.log2() - sum_solvetimes.log2() + ctx.config.target_solvetime_log2();
+        let next_weight = next_weight.max(ctx.config.min_weight);
         r64(next_weight)
     }
 }
@@ -996,7 +1078,10 @@ struct SimOpt {
 fn main_sim(opt: SimOpt) -> Result<(), Box<dyn Error>> {
     use std::thread;
 
-    let daa: DynDaa = match opt.daa.to_lowercase().as_ref() {
+    let daa: BoxedDaa = match opt.daa.to_lowercase().as_ref() {
+        "const" => Box::new(ConstantDaa {
+            ..Default::default()
+        }),
         "htr" => Box::new(Htr {
             ..Default::default()
         }),
@@ -1048,12 +1133,16 @@ fn main_sim(opt: SimOpt) -> Result<(), Box<dyn Error>> {
                 let mut sim = Simulator::new(config.clone());
                 sim.create_node(&tpl_regular);
                 sim.create_node(&tpl_regular);
-                let idx = sim.create_node(&tpl_strong);
+                sim.create_node(&tpl_regular);
+                sim.create_node(&tpl_regular);
+                let idx1 = sim.create_node(&tpl_strong);
+                let idx2 = sim.create_node(&tpl_strong);
                 info!("sim-{} start, run for {}s", i, time);
                 sim.run(time);
-                let time2 = time * 6.;
+                let time2 = time * 3.;
                 info!("sim-{} remove strong miner, run for {}s", i, time2);
-                let _ = sim.remove_node(idx);
+                let _ = sim.remove_node(idx1);
+                let _ = sim.remove_node(idx2);
                 sim.run(time2);
                 info!("sim-{} over", i);
                 sim
@@ -1108,6 +1197,12 @@ struct PlotOpt {
     /// PNG file to save plot to
     #[structopt(long)]
     save_plot: PathBuf,
+    /// When to start plotting
+    #[structopt(long)]
+    from: Option<u32>,
+    /// When to stop plotting
+    #[structopt(long)]
+    until: Option<u32>,
 }
 
 fn main_plot(opt: PlotOpt) -> Result<(), Box<dyn Error>> {
@@ -1129,7 +1224,7 @@ fn _main_plot<'a, DB: DrawingBackend>(
     opt: &PlotOpt,
     root: &'a mut DrawingArea<DB, Shift>,
 ) -> Result<(), Box<dyn Error + 'a>> {
-    use plotters::palette::{Gradient, LinSrgb};
+    use plotters::palette::{Gradient, LinSrgb, rgb::Rgb};
 
     let sims = load_sims(&opt.load_sim)?;
 
@@ -1138,16 +1233,28 @@ fn _main_plot<'a, DB: DrawingBackend>(
     let t0 = 0u32;
     let tf = sims.iter().map(|s| s.timestamp as u32).max().unwrap_or(60);
 
+    let t0 = if let Some(t0) = opt.from { t0 } else { t0 };
+    let tf = if let Some(tf) = opt.until { tf } else { tf };
+
     //let history: vec<_> = self.history.iter().filter(|w| time_range.contains(&w.timestamp)).collect();
     //let max_weight = blocks.iter()
     //    .map(|b| b.weight)
     //    .chain(history.iter().map(|w| w.hashrate_weight(&self.config)))
     //    .fold(0.0f64, |a, b| a.max(b));
-    let max_weight = 70.0f64;
+    let max_weight = sims.iter()
+        .map(|s| s.known_blocks.iter().map(|(_, b)| b.block.rweight))
+        .flatten()
+        // TODO: chain with hashrate history
+        .max().map(|r| r.raw()).unwrap_or(0.0);
+    let min_weight = sims.iter()
+        .map(|s| s.known_blocks.iter().map(|(_, b)| b.block.rweight))
+        .flatten()
+        // TODO: chain with hashrate history
+        .min().map(|r| r.raw()).unwrap_or(0.0);
 
     let x0 = t0 as f32;
     let xf = tf as f32;
-    let y0 = 0.0;
+    let y0 = (((min_weight as u64) / 5 - 1) * 5) as f32;
     let yf = (((max_weight as u64) / 5 + 1) * 5) as f32;
 
     let mut chart = ChartBuilder::on(&root)
@@ -1159,6 +1266,9 @@ fn _main_plot<'a, DB: DrawingBackend>(
 
     chart
         .configure_mesh()
+        //.disable_x_mesh()
+        //.set_tick_mark_size(LabelAreaPosition::Top, 3600)
+        //.set_tick_mark_size(LabelAreaPosition::Bottom, 3600*24)
         .y_desc("Difficulty (log2 scale)")
         .x_desc("Time (seconds)")
         .axis_desc_style(("sans-serif", 12).into_font())
@@ -1166,16 +1276,18 @@ fn _main_plot<'a, DB: DrawingBackend>(
 
     let time_range = t0..tf;
     let colors = [
-        LinSrgb::new(250. / 256., 209. / 256., 152. / 256.),
-        LinSrgb::new(242. / 256., 173. / 256., 78. / 256.),
-        LinSrgb::new(154. / 256., 58. / 256., 127. / 256.),
         LinSrgb::new(69. / 256., 16. / 256., 129. / 256.),
+        LinSrgb::new(154. / 256., 58. / 256., 127. / 256.),
+        LinSrgb::new(242. / 256., 173. / 256., 78. / 256.),
+        LinSrgb::new(250. / 256., 209. / 256., 152. / 256.),
     ];
+    // TODO: refactor to use gradient.take(n).rev() once new version is released
     let gradient = Gradient::new(colors.iter().cloned());
-    for (sim, color) in sims.iter().zip(gradient.take(sims.len())) {
+    let plot_colors = gradient.take(sims.len()).collect::<Vec<Rgb<_, f64>>>();
+    for (sim, color) in sims.iter().zip(plot_colors.iter().rev()) {
         let node = &sim.example_node().ok_or("no nodes")?;
-        let blockchain_view: Vec<_> = node
-            .iter_blockchain()
+        let blockchain_view: Vec<_> = node.tip
+            .iter_blockchain(&sim.known_blocks)
             .filter(|b| time_range.contains(&b.block.timestamp))
             .collect();
         chart.draw_series(PointSeries::of_element(
@@ -1185,7 +1297,7 @@ fn _main_plot<'a, DB: DrawingBackend>(
                 .rev()
                 .map(|&b| (b.block.timestamp as f32, b.block.weight() as f32)),
             1, // size of the point
-            ShapeStyle::from(&color).filled(),
+            ShapeStyle::from(color).filled(),
             &|coord, size, style| {
                 EmptyElement::at(coord) + Circle::new((0, 0), size, style)
                 /*+ Text::new(
@@ -1196,24 +1308,28 @@ fn _main_plot<'a, DB: DrawingBackend>(
             },
         ))?;
         //.label("blocks")
-        //.legend(|(x, y)| Path::new(vec![(x, y), (x + 20, y)], &RED));
+        //.legend(|(x, y)| Path::new(vec![(x, y), (x + 20, y)], &color));
     }
 
-    /*chart
-    .draw_series(LineSeries::new(
-        history
-            .iter()
-            .skip(1) // first one always seems to draw a vertical line
-            .map(|w| (w.timestamp as f32, w.hashrate_weight(&self.config) as f32)),
-        &CYAN,
-    ))?
-    .label("hashrate")
-    .legend(|(x, y)| Path::new(vec![(x, y), (x + 20, y)], &RED));*/
+    // only draw for first simulation
+    for sim in sims.iter().take(1) {
+        use plotters::element::{Path as PathElement};
+        chart
+        .draw_series(LineSeries::new(
+            sim.iter_measurements()
+                .skip(1) // first one always seems to draw a vertical line
+                .map(|(t, m)| (t as f32, m.estimated_network_weight as f32)),
+            &RED,
+        ))?
+        .label("hashrate")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
-    /*chart.configure_series_labels()
-    .background_style(&WHITE.mix(0.8))
-    .border_style(&BLACK)
-    .draw()?;*/
+        /*chart.configure_series_labels()
+        .background_style(&WHITE.mix(0.8))
+        .border_style(&BLACK)
+        .draw()?;*/
+    }
+
     Ok(())
 }
 
