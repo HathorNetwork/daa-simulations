@@ -90,6 +90,31 @@ def run_w60(manager):
 def run_w70(manager):
     return _run1(manager, 2**60, 1024)
 
+def run_preview20x(manager):
+    manager.start()
+    manager.addMiner(Miner(630 * (2**20), is_quiet=True))
+    manager.addMiner(Miner(630 * (2**20), is_quiet=True))
+    manager.run(3600 * 1.5, show_progress=True)
+    manager.addMiner(Miner(18 * (2**30), is_quiet=True))
+    manager.run(3600 * 1, show_progress=True)
+    manager.stopMiner(2)
+    manager.run(3600 * 6, show_progress=True)
+    return manager
+
+def run_preview1000x(manager):
+    manager.start()
+    manager.addMiner(Miner(630 * (2**20), is_quiet=True))
+    manager.addMiner(Miner(630 * (2**20), is_quiet=True))
+    manager.run(3600 * 3, show_progress=True)
+    manager.addMiner(Miner(18 * (2**30), is_quiet=True))
+    manager.run(3600 * 1, show_progress=True)
+    manager.stopMiner(0)
+    manager.stopMiner(1)
+    manager.stopMiner(2)
+    manager.addMiner(Miner(2**24, is_quiet=True))
+    manager.run(3600 * 12, show_progress=True)
+    return manager
+
 daa_choices = {
     'lwma': lambda: LWMA(n=134, tl_rules=False),
     'htr': lambda: HTR(),
@@ -109,6 +134,8 @@ profile_choices = dict((f.__name__, f) for f in [
     run_51attack_50,
     run_51attack_10,
     run_ts_tampering,
+    run_preview20x,
+    run_preview1000x,
 ])
 
 def main():

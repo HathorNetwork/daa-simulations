@@ -53,9 +53,10 @@ def blocks_per_miner(it):
     return d
 
 
-def _plot_difficulty(manager, *, min_timestamp=0, highlight_miner=None):
+def _plot_difficulty(manager, *, min_timestamp=0, highlight_miner=None, x_factor = None):
     miner = manager.miners[0]
-    x_factor = 3600 * 24   # days
+    if x_factor is None:
+        x_factor = 3600 * 24   # days
 
     import matplotlib.pyplot as plt
     x_values = []
@@ -86,10 +87,11 @@ def _plot_difficulty(manager, *, min_timestamp=0, highlight_miner=None):
     plt.plot(x_values, y_values, 'k')
 
 
-def _plot_number_of_blocks(manager):
+def _plot_number_of_blocks(manager, *, x_factor=None):
     import matplotlib.pyplot as plt
     miner = manager.miners[0]
-    x_factor = 3600 * 24   # days
+    if x_factor is None:
+        x_factor = 3600 * 24   # days
     x_values = [block.timestamp / x_factor for block in miner.best_block.get_blockchain()]
     y_values = list(len(x_values) - x for x in range(len(x_values)))
     plt.plot(x_values, y_values, '-', linewidth=0.5)
@@ -101,11 +103,21 @@ def plot_difficulty(managers, *, min_timestamp=0, save_to=None, highlight_miner=
 
     print('Total: {} loops'.format(len(managers)))
 
+    max_timestamp = 0
+    for manager in managers:
+        miner = manager.miners[0]
+        max_timestamp = max(max_timestamp, max(block.timestamp for block in miner.best_block.get_blockchain()))
+
+    x_factor = 3600 * 24  # days
+    xlabel = 'Time (days)'
+    if max_timestamp < x_factor:
+        x_factor = 3600  # hours
+        xlabel = 'Time (hours)'
+
     title = ', '.join(list(set(x.daa.__class__.__name__ for x in managers)))
 
     grid = plt.GridSpec(4, 1, wspace=0.4, hspace=0.3)
     plt.subplot(grid[:3, 0])
-    plt.xlabel('Time (days)')
     plt.ylabel('Difficulty ($log_2(H)$)')
     plt.xticks(fontsize=8)
     plt.yticks(fontsize=8)
@@ -113,16 +125,17 @@ def plot_difficulty(managers, *, min_timestamp=0, save_to=None, highlight_miner=
     plt.minorticks_on()
     plt.grid(which='both', linewidth=0.25, linestyle='--')
     for manager in managers:
-        _plot_difficulty(manager, min_timestamp=min_timestamp, highlight_miner=highlight_miner)
+        _plot_difficulty(manager, min_timestamp=min_timestamp, highlight_miner=highlight_miner, x_factor=x_factor)
 
-    plt.subplot(grid[3, 0])
+    plt.subplot(grid[3:, 0])
+    plt.xlabel(xlabel)
     plt.ylabel('Blocks')
     plt.xticks(fontsize=8)
     plt.yticks(fontsize=8)
     plt.minorticks_on()
     plt.grid(which='both', linewidth=0.25, linestyle='--')
     for manager in managers:
-        _plot_number_of_blocks(manager)
+        _plot_number_of_blocks(manager, x_factor=x_factor)
 
     if save_to:
         plt.savefig(save_to, dpi=300)
